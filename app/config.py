@@ -29,6 +29,9 @@ DB_PATH = DATA_DIR / "demux.db"
 INCOMING_DIR = DATA_DIR / "incoming"
 WORK_DIR = DATA_DIR / "work"
 PUBLISHED_DIR = DATA_DIR / "published"
+# ZIP bundles are staged here: same filesystem as published data, so the
+# archive never needs to be held in memory and is removed after the response.
+BUNDLE_TMP_DIR = DATA_DIR / "bundle-tmp"
 
 # Hard limits from the task specification.
 MAX_SAMPLES = 8
@@ -37,5 +40,5 @@ MAX_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024  # 512 MiB across both mates
 HEARTBEAT_FLUSH_EVERY = 256  # records between heartbeat writes
 POLL_INTERVAL = float(os.environ.get("DEMUX_POLL_INTERVAL", "1.0"))
 
-for _d in (DATA_DIR, INCOMING_DIR, WORK_DIR, PUBLISHED_DIR):
+for _d in (DATA_DIR, INCOMING_DIR, WORK_DIR, PUBLISHED_DIR, BUNDLE_TMP_DIR):
     _d.mkdir(parents=True, exist_ok=True)

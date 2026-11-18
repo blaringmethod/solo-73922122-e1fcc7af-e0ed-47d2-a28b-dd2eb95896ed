@@ -9,6 +9,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import gzip
+import hashlib
 import os
 import shutil
 import time
@@ -149,18 +150,29 @@ def _best_sample(seq1: bytes, seq2: bytes,
 
 
 class _Writers:
-    """One gzip writer per (bucket, mate); files opened eagerly."""
+    """One gzip writer per (bucket, mate); files opened eagerly.
+
+    Every byte handed to the gzip layer is also fed to a SHA-256 hasher, so
+    the digest describes exactly the bytes that are later published. The
+    hasher is fed below the compressor (through a tee) to hash the gzip bytes
+    that end up on disk, not the logical FASTQ payload.
+    """
 
     def __init__(self, out_dir: Path, sample_ids: list[str]):
         self._files: dict[tuple[str, str], gzip.GzipFile] = {}
+        self._raw: dict[tuple[str, str], object] = {}
+        self._hashers: dict[tuple[str, str], "hashlib._Hash"] = {}
         out_dir.mkdir(parents=True, exist_ok=True)
         buckets = sample_ids + [QUARANTINE]
         for bucket in buckets:
             for mate in ("r1", "r2"):
                 fh = open(out_dir / f"{bucket}.{mate}.fastq.gz", "wb")
+                hasher = hashlib.sha256()
+                tee = _HashingWriter(fh, hasher)
                 self._files[(bucket, mate)] = gzip.GzipFile(
-                    filename="", mode="wb", fileobj=fh, compresslevel=6)
-        self._raw = {k: v.fileobj for k, v in self._files.items()}
+                    filename="", mode="wb", fileobj=tee, compresslevel=6)
+                self._raw[(bucket, mate)] = fh
+                self._hashers[(bucket, mate)] = hasher
 
     def write(self, bucket: str, mate: str, rec: Record, trimmed: bool) -> None:
         gf = self._files[(bucket, mate)]
@@ -174,16 +186,51 @@ class _Writers:
             gf.write(b"+\n")
             gf.write(rec.qual + b"\n")
 
-    def close(self) -> None:
+    def close(self) -> dict[tuple[str, str], tuple[int, str]]:
+        """Finish gzip streams and return {key: (size, sha256)} for each file."""
+        sealed: dict[tuple[str, str], tuple[int, str]] = {}
         # GzipFile does not own an externally supplied fileobj: close the
         # gzip layer (flush footer + buffered data), then the raw file.
         for key, gf in self._files.items():
             gf.close()
-            self._raw[key].close()
+            raw = self._raw[key]
+            raw.flush()
+            sealed[key] = (raw.tell(), self._hashers[key].hexdigest())
+            raw.close()
+        return sealed
+
+
+class _HashingWriter:
+    """Minimal write-only file wrapper that hashes every byte written."""
+
+    def __init__(self, raw, hasher):
+        self._raw = raw
+        self._hasher = hasher
+
+    def write(self, data) -> int:
+        self._hasher.update(data)
+        return self._raw.write(data)
+
+    def flush(self) -> None:
+        self._raw.flush()
 
 
 def _work_dir(job_id: str) -> Path:
     return config.WORK_DIR / job_id
+
+
+def hash_file(path: Path, chunk_size: int = 1024 * 1024) -> tuple[int, str]:
+    """Stream a file once; return (size_in_bytes, sha256_hex)."""
+    hasher = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            size += len(chunk)
+    return size, hasher.hexdigest()
 
 
 def _lock_path(job_id: str) -> Path:
@@ -258,15 +305,19 @@ def process_job(job_row, instance_id: str) -> None:
                 if pair_index % config.HEARTBEAT_FLUSH_EVERY == 0:
                     db.heartbeat(job_id, instance_id)
         finally:
-            writers.close()
+            sealed = writers.close()
 
-        # Every bucket (samples + quarantine), both mates, must exist and be
-        # a readable gzip file, even when the bucket received no reads.
+        # Every bucket (samples + quarantine), both mates, must exist, be a
+        # readable gzip, and match the digest computed over the bytes written.
         for bucket in sample_ids + [QUARANTINE]:
             for mate in ("r1", "r2"):
                 p = staged / f"{bucket}.{mate}.fastq.gz"
                 if not p.exists() or p.stat().st_size == 0:
                     raise FastqFormatError(f"missing output file {p.name}")
+                size, digest = sealed[(bucket, mate)]
+                if p.stat().st_size != size:
+                    raise FastqFormatError(
+                        f"output {p.name} changed size before sealing")
                 try:
                     with gzip.open(p, "rb") as verify:
                         while verify.read(65536):
@@ -289,20 +340,40 @@ def process_job(job_row, instance_id: str) -> None:
             }
             for bucket, n in counts.items()
         ]
-        db.publish_job(job_id, lane, count_rows)
+        # Re-hash the moved files so the sealed values describe the published
+        # paths, and fail the lane before publish if anything differs.
+        manifest_rows: list[dict] = []
+        for bucket in sample_ids + [QUARANTINE]:
+            entry: dict = {"sample_id": bucket}
+            for mate in ("r1", "r2"):
+                path = final_publish / f"{bucket}.{mate}.fastq.gz"
+                size, digest = hash_file(path)
+                if (size, digest) != sealed[(bucket, mate)]:
+                    raise FastqFormatError(
+                        f"published {path.name} does not match sealed bytes")
+                entry[f"{mate}_file"] = str(path)
+                entry[f"{mate}_size"] = size
+                entry[f"{mate}_sha256"] = digest
+            manifest_rows.append(entry)
 
-        # Publish is durable; only now remove inputs and scratch space.
-        for p in (r1_in, r2_in):
-            try:
-                p.unlink()
-            except FileNotFoundError:
-                pass
-        incoming_dir = r1_in.parent
+        db.publish_job(job_id, lane, count_rows, manifest_rows)
+
+        # Publish is durable. Cleanup below is best-effort: a failure here
+        # must never turn a published lane into a failed job. Leftovers are
+        # reclaimed by startup recovery.
         try:
-            incoming_dir.rmdir()
+            for p in (r1_in, r2_in):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            try:
+                r1_in.parent.rmdir()
+            except OSError:
+                pass
+            shutil.rmtree(work, ignore_errors=True)
         except OSError:
             pass
-        shutil.rmtree(work, ignore_errors=True)
     finally:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -422,6 +493,17 @@ def recover_on_startup() -> list[str]:
                     continue
             notes.append(f"removing stale incoming upload {d.name}")
             shutil.rmtree(d, ignore_errors=True)
+    # 5. Abandoned ZIP staging files (crash between build and unlink). They
+    #    are named by random UUID and never shared, so only age matters.
+    if config.BUNDLE_TMP_DIR.exists():
+        now = time.time()
+        for f in config.BUNDLE_TMP_DIR.iterdir():
+            if not f.is_file() or not f.name.endswith(".zip"):
+                continue
+            if now - f.stat().st_mtime < grace_seconds:
+                continue
+            f.unlink(missing_ok=True)
+            notes.append(f"removing stale bundle staging {f.name}")
     return notes
 
 

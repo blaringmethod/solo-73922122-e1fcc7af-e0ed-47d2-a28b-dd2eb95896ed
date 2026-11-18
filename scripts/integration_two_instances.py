@@ -213,6 +213,35 @@ def main() -> int:
         assert set(json.loads(snap2)["lanes"]) == before
         print(f"    snapshot keeps {len(before)} lanes; later lane excluded")
 
+        print("[4b] verified ZIP bundle built on the other instance")
+        code, bundle = http(
+            "GET", f"{BASE_B}/snapshots/{snap_id}/samples/sampleA/bundle.zip")
+        assert code == 200, (code, bundle[:300])
+        import hashlib as _hl
+        import io as _io
+        import zipfile as _zip
+        with _zip.ZipFile(_io.BytesIO(bundle)) as zf:
+            names = set(zf.namelist())
+            assert {"sampleA.r1.fastq.gz", "sampleA.r2.fastq.gz",
+                    "manifest.json", "README.txt"} <= names, names
+            manifest = json.loads(zf.read("manifest.json"))
+            assert manifest["lanes"] == sorted(before, key=lambda lane: [
+                r["lane"] for r in json.loads(
+                    http("GET", f"{BASE_B}/lanes")[1])
+            ].index(lane))
+            for mate in ("r1", "r2"):
+                raw = zf.read(f"sampleA.{mate}.fastq.gz")
+                detail = {d["lane"]: d for d in manifest["lanes_detail"]}
+                offsets = 0
+                for lane in manifest["lanes"]:
+                    want = detail[lane][mate]
+                    part = raw[offsets:offsets + want["size"]]
+                    assert _hl.sha256(part).hexdigest() == want["sha256"]
+                    offsets += want["size"]
+                assert offsets == len(raw)
+        print(f"    bundle lanes={manifest['lanes']} "
+              f"bytes={len(bundle)} sha256={_hl.sha256(bundle).hexdigest()[:16]}")
+
         print("[5] duplicate lane reuses task; different input rejected (409)")
         boundary, body = multipart("laneIT0", barcodes, r1, r2)
         code, resp = http("POST", f"{BASE_B}/jobs", raw_path=(boundary, body))

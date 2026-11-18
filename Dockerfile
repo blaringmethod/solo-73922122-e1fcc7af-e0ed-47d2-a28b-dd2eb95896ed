@@ -11,6 +11,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY scripts/verify_bundle.py ./scripts/verify_bundle.py
+ENV PYTHONPATH=/srv
 
 # Unprivileged runtime user; /data is provided by the shared volume.
 RUN useradd --create-home --uid 10001 demux \

@@ -19,6 +19,7 @@ services:
       retries: 3
 
   demux-b:
+    build: .
     image: demux-api:latest
     container_name: demux-b
     environment:

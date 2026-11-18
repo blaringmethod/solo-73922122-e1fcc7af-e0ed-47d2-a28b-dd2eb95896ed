@@ -12,9 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 
-from . import config, db, processing
+from . import config, db, package, processing
 from .worker import JobWorker, new_instance_id
 
 _IO_CHUNK = 1024 * 1024
@@ -135,7 +139,21 @@ app = FastAPI(
         "with at most one substitution and a unique candidate; everything "
         "else is quarantined. Barcodes and qualities are trimmed on "
         "assignment. Published lanes, per-sample files, quarantine files and "
-        "counts become visible atomically."
+        "counts become visible atomically.\n\n"
+        "At publication each output file's size and SHA-256 are **sealed** in "
+        "the same transaction that makes the lane visible; a lane is never "
+        "published without this evidence. Snapshots freeze both the lane list "
+        "and a copy of its sealed evidence.\n\n"
+        "`GET /snapshots/{snapshot_id}/samples/{sample_id}/bundle.zip` returns "
+        "one verified ZIP for a sample: only snapshot lanes that contain the "
+        "sample, R1 and R2 concatenated as gzip members in snapshot order, "
+        "plus `manifest.json` and `README.txt`. Every file is checked against "
+        "its sealed digest while the same bytes are written into the archive, "
+        "and the finished archive is re-verified before the first byte is "
+        "sent. A missing mate, digest mismatch, or a lane without sealed "
+        "evidence fails the whole request with no partial ZIP.\n\n"
+        "See `docs/bundle.md` in the repository for the contract and a "
+        "copy-paste verification procedure."
     ),
     lifespan=lifespan,
 )
@@ -286,12 +304,28 @@ def get_lane(lane: str):
         raise HTTPException(404, "lane not published (or unknown)")
     counts = [dict(r) for r in db.lane_counts(lane)]
     total = sum(c["read_pairs"] for c in counts)
+    manifests = [
+        {
+            "sample_id": m["sample_id"],
+            "r1": {"file": Path(m["r1_file"]).name, "size": m["r1_size"],
+                   "sha256": m["r1_sha256"]},
+            "r2": {"file": Path(m["r2_file"]).name, "size": m["r2_size"],
+                   "sha256": m["r2_sha256"]},
+            "sealed_at": m["sealed_at"],
+        }
+        for m in db.get_conn().execute(
+            "SELECT * FROM lane_manifests WHERE lane=? ORDER BY sample_id",
+            (lane,)).fetchall()
+    ]
     return {
         "lane": lane,
         "job_id": pub["job_id"],
         "published_at": pub["published_at"],
         "total_read_pairs": total,
         "counts": counts,
+        "sealed_manifests": manifests,
+        "sealed": all(m["r1"]["sha256"] and m["r2"]["sha256"]
+                      for m in manifests) if manifests else False,
     }
 
 
@@ -370,6 +404,77 @@ def _iter_concat(files: list[Path]):
                 if not chunk:
                     break
                 yield chunk
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/samples/{sample_id}/bundle.zip",
+    responses={
+        200: {
+            "content": {"application/zip": {}},
+            "description": (
+                "Verified snapshot-scoped R1+R2 bundle. Contains "
+                "<sample>.r1.fastq.gz, <sample>.r2.fastq.gz (concatenated "
+                "per-lane gzip members in snapshot order), manifest.json and "
+                "README.txt. Any verification failure returns an error and no "
+                "partial archive."),
+        },
+        404: {"description": "Snapshot missing or sample absent from it"},
+        409: {"description": (
+            "Missing mate, digest mismatch, or a participating lane without "
+            "sealed digest evidence. Whole request fails; no partial ZIP.")},
+    },
+)
+def snapshot_sample_bundle(snapshot_id: str, sample_id: str):
+    """Build the bundle in a temp file, verify it, then send those exact bytes.
+
+    The archive is created and re-verified before a single byte reaches the
+    client, so an error can never produce a truncated/partial ZIP. The
+    response is sent with the archive's SHA-256 so the caller can prove the
+    received file is byte-identical to the one that was verified.
+    """
+    try:
+        plan = package.plan_bundle(snapshot_id, sample_id)
+        config.BUNDLE_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = config.BUNDLE_TMP_DIR / f"{uuid.uuid4().hex}.zip"
+        try:
+            info = package.write_bundle(plan, tmp)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+    except package.PackagingError as exc:
+        raise HTTPException(exc.status, exc.message) from exc
+
+    filename = f"{sample_id}.snapshot-{snapshot_id}.zip"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Snapshot-Id": snapshot_id,
+        "X-Bundle-Lanes": ",".join(plan.participants),
+        "X-Bundle-SHA256": info["archive"]["sha256_hex"],
+        "X-Bundle-Size": str(info["archive"]["size"]),
+    }
+
+    def _send_then_cleanup():
+        # The archive was fully built and re-verified before this point, so
+        # headers/status reflect a complete, valid bundle. Only now is it
+        # streamed, in fixed chunks, and the temp file removed afterwards.
+        try:
+            with open(tmp, "rb") as fh:
+                while True:
+                    chunk = fh.read(_IO_CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+
+    return StreamingResponse(
+        _send_then_cleanup(), media_type="application/zip", headers=headers)
 
 
 @app.get("/snapshots/{snapshot_id}/samples/{sample_id}/{mate}")

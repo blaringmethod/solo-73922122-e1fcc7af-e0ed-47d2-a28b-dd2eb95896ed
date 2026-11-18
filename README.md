@@ -27,6 +27,17 @@ volume** with a **128 MiB memory limit**.
 * Snapshots freeze the published lane list at creation time. Sample/
   quarantine downloads through a snapshot only ever concatenate files from
   that fixed list — lanes published later never mix in.
+* At publish time every per-sample file's size and SHA-256 are **sealed in
+  the same DB transaction** that makes the lane visible. A lane cannot be
+  published without that evidence, and the evidence is copied into each
+  snapshot so later changes cannot rewrite history.
+* `GET /snapshots/{id}/samples/{sample}/bundle.zip` builds one verified
+  paired-end ZIP: only snapshot lanes containing the sample, R1/R2
+  concatenated as gzip members in snapshot order, plus `manifest.json` and
+  `README.txt`. Files are hashed as the exact bytes are written into the
+  archive, the finished ZIP is re-verified, and *any* missing mate, digest
+  mismatch or unsealed legacy lane fails the whole request — no partial ZIP
+  is ever sent. See [`docs/bundle.md`](docs/bundle.md).
 
 ## Running (Docker Compose, two instances on a shared volume)
 
@@ -51,6 +62,11 @@ python scripts/make_demo_fastq.py /tmp/demo          # makes R1/R2.fastq.gz
 curl http://localhost:8001/lanes/demoLane             # counts
 curl -OJ http://localhost:8001/lanes/demoLane/samples/sampleA/r1
 curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
+
+# Freeze a snapshot, then download the verified paired-end package.
+SNAP=$(curl -s -X POST http://localhost:8001/snapshots | python -c \
+  "import json,sys; print(json.load(sys.stdin)['snapshot_id'])")
+curl -OJ http://localhost:8001/snapshots/$SNAP/samples/sampleA/bundle.zip
 ```
 
 ## API surface
@@ -67,6 +83,7 @@ curl -OJ http://localhost:8001/lanes/demoLane/quarantine/r1
 | GET | `/snapshots`, `/snapshots/{id}` | List/inspect snapshots |
 | GET | `/snapshots/{id}/samples/{sample_id}/{mate}` | Snapshot-scoped concatenated download |
 | GET | `/snapshots/{id}/quarantine/{mate}` | Snapshot-scoped quarantine download |
+| GET | `/snapshots/{id}/samples/{sample}/bundle.zip` | Verified paired-end ZIP (mates + manifest + README) |
 | GET | `/health` | Liveness, instance id, current job, queue depth |
 
 ## Concurrency and crash safety
@@ -91,13 +108,20 @@ reads, one open gzip writer per bucket). No file is ever buffered whole.
 The automated streaming test processes hundreds of MiB of decompressed
 data with RSS growth below 64 MiB.
 
+ZIP bundles follow the same rule: the archive is written to
+`<data>/bundle-tmp/`, re-verified there, and only then streamed to the
+client in 1 MiB chunks, so bundle size does not affect process memory.
+Stale temp archives are cleaned up on startup.
+
 ## Layout
 
 ```
 app/            FastAPI app, SQLite layer, streaming splitter, worker
-scripts/        demo FASTQ generator, two-instance integration check
+scripts/        demo FASTQ generator, bundle verifier, two-instance check
+docs/           bundle contract, sealing model, verification procedure
 tests/          pytest suite (happy path, corruption, retry, recovery,
-                barcode rules, size budget, streaming memory)
+                barcode rules, size budget, streaming memory, sealed
+                evidence and ZIP bundle verification)
 Dockerfile      python:3.11-slim, non-root user, /data volume, healthcheck
 docker-compose.yml  two 128 MiB instances sharing one named volume
 ```
@@ -107,4 +131,5 @@ docker-compose.yml  two 128 MiB instances sharing one named volume
 ```bash
 python -m pytest tests/ -q
 python scripts/integration_two_instances.py   # real two-process check
+python scripts/verify_bundle.py BUNDLE.zip [SHA256]   # verify a download
 ```

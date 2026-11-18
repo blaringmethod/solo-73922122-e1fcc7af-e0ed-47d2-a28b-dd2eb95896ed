@@ -213,3 +213,28 @@ def test_recovery_never_removes_live_instance_work(data_dir):
     finally:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
         lock_fh.close()
+
+
+def test_cleanup_error_after_publish_keeps_lane_published(
+        client, helpers, tmp_path, monkeypatch):
+    """A post-commit cleanup failure must not demote a published lane."""
+    import json as _json
+    from app import processing
+
+    r1 = [(b"a", b"AAAAAAAATT", b"I" * 10)]
+    r2 = [(b"a", b"CCCCCCCCGG", b"J" * 10)]
+    p1, p2 = helpers.make_pair(r1, r2, tmp_path)
+    resp = _post(client, "cleanupLane", BARCODES, p1, p2)
+    job_id = resp.json()["job"]["job_id"]
+
+    real_rmtree = processing.shutil.rmtree
+
+    def boom(path, *a, **kw):
+        if str(path).endswith(job_id):
+            raise OSError("simulated cleanup failure")
+        return real_rmtree(path, *a, **kw)
+
+    monkeypatch.setattr(processing.shutil, "rmtree", boom)
+    row = _wait(client, job_id)
+    assert row["status"] == "published", row
+    assert client.get("/lanes/cleanupLane").status_code == 200

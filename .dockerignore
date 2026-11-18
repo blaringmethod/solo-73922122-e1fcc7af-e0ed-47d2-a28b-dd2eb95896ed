@@ -3,5 +3,7 @@ __pycache__/
 .pytest_cache/
 .git/
 tests/
-scripts/
 *.egg-info/
+scripts/__init__.py
+scripts/integration_two_instances.py
+scripts/make_demo_fastq.py
